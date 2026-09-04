@@ -30,6 +30,7 @@ BUILD_FLAGS="${BUILD_FLAGS:-CFLAGS=-static LDFLAGS=\"-static -s\" NO_OPENSSL=1 N
 }
 
 mkdir -p "${OUT_DIR}"
+OUT_DIR="$(cd "${OUT_DIR}" && pwd)"
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
