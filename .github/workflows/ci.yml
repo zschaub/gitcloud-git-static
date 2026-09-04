@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Read pinned git version
+        id: version
+        run: echo "git_version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      # Builds through the `smoketest` stage: source verification, static
+      # build, and the full GitCloud command-sequence smoke test all happen
+      # as part of this single build - it fails the job on any of them.
+      - name: Build and smoketest (native, no emulation)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          target: smoketest
+          build-args: |
+            GIT_VERSION=${{ steps.version.outputs.git_version }}
+          push: false
+          load: false

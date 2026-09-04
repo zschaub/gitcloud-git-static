@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_version:
+        description: "Upstream git version to build (e.g. 2.55.0)"
+        required: true
+      build_rev:
+        description: "This repo's build revision for that git version (bump to re-release the same git_version with a revised build recipe)"
+        required: false
+        default: "1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve base image digest (for BUILD.md provenance)
+        id: base
+        run: |
+          docker pull alpine:3.20
+          echo "digest=$(docker inspect --format='{{index .RepoDigests 0}}' alpine:3.20)" >> "$GITHUB_OUTPUT"
+
+      # Builds through the `export` stage, which depends on the `smoketest`
+      # stage in the Dockerfile - the exact GitCloud command sequence, run
+      # in a container with no system git, gates whether this step succeeds.
+      - name: Build, smoketest (gate), and export binary
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          target: export
+          build-args: |
+            GIT_VERSION=${{ inputs.git_version }}
+          push: false
+          outputs: type=local,dest=dist
+
+      - name: Re-verify upstream source (for COPYING + packaging provenance)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends gnupg xz-utils
+          ./scripts/verify-source.sh "${{ inputs.git_version }}" /tmp/git-src
+
+      - name: Package release tarball + checksum
+        env:
+          BASE_IMAGE_DIGEST: ${{ steps.base.outputs.digest }}
+        run: |
+          ./scripts/package-release.sh \
+            "${{ inputs.git_version }}" "${{ matrix.arch }}" \
+            /tmp/git-src dist/git dist/release
+
+      # Re-extract the binary from the actual packaged tarball (not just the
+      # raw build-stage output) so this proves the shipped artifact itself
+      # works, catching any packaging-step corruption.
+      - name: Re-run standalone smoketest against the packaged tarball
+        run: |
+          tar -xzf "dist/release/git-${{ inputs.git_version }}-linux-${{ matrix.arch }}.tar.gz" \
+            -C dist --strip-components=1 \
+            "git-${{ inputs.git_version }}-linux-${{ matrix.arch }}/git"
+          docker build -f smoketest/Dockerfile -t release-smoketest .
+          docker run --rm release-smoketest
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            dist/release/*.tar.gz
+            dist/release/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify checksums before publishing
+        working-directory: release-assets
+        run: sha256sum -c *.sha256
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ inputs.git_version }}-${{ inputs.build_rev }}"
+          gh release create "$tag" \
+            --title "git ${{ inputs.git_version }} (build ${{ inputs.build_rev }})" \
+            --notes "Static, musl-linked git ${{ inputs.git_version }} for linux/amd64 and linux/arm64. See README.md for scope and licensing notes; each tarball bundles BUILD.md with exact build flags and COPYING." \
+            release-assets/*.tar.gz release-assets/*.tar.gz.sha256
